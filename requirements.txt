@@ -1,12 +1,12 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
-streamlit==1.45.1
+-r requirements-ui.txt
 langchain==0.3.25
 langchain-community==0.3.24
 langchain-chroma==0.2.4
 langchain-huggingface==0.2.0
 langchain-openai==0.3.16
-chromadb==1.0.8
+chromadb==1.0.21
 pypdf==5.5.0
 sentence-transformers==4.1.0
 rank-bm25==0.2.2

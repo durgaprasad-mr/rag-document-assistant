@@ -1,13 +1,25 @@
 import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from shutil import copyfile
+from tempfile import TemporaryDirectory
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from openai import APIError
 from pydantic import BaseModel
 
-from ingest import ingest_pdf, ingest_directory
-from rag_pipeline import add_documents, generate_answer
+from .ingest import DATA_DIR, InvalidPDFError, ingest_directory, ingest_pdf
+from .rag_pipeline import AnswerUnavailableError, add_documents, generate_answer, index_lock
 
-app = FastAPI(title="RAG Document Assistant", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    add_documents(ingest_directory())
+    yield
+
+
+app = FastAPI(title="RAG Document Assistant", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")],
@@ -21,35 +33,42 @@ class AskRequest(BaseModel):
     query: str
 
 
-@app.on_event("startup")
-def load_existing_documents():
-    add_documents(ingest_directory())
-
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+def upload_pdf(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    _, uploaded_chunks = ingest_pdf(file)
-    from ingest import PyPDFLoader, RecursiveCharacterTextSplitter
-    from pathlib import Path
+    with TemporaryDirectory(dir=DATA_DIR) as staging:
+        try:
+            staged_pdf, chunks = ingest_pdf(file, Path(staging))
+        except InvalidPDFError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    pdf_path = Path(os.getenv("DATA_PATH", "./data")) / Path(file.filename).name
-    chunks = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100).split_documents(
-        PyPDFLoader(str(pdf_path)).load()
-    )
-    for chunk in chunks:
-        chunk.metadata["source"] = pdf_path.name
-        chunk.metadata["document_name"] = pdf_path.name
+        destination = DATA_DIR / staged_pdf.name
+        previous_pdf = Path(staging) / "previous"
+        with index_lock:
+            if destination.is_file():
+                copyfile(destination, previous_pdf)
+            staged_pdf.replace(destination)
+            try:
+                indexed = add_documents(chunks)
+            except Exception:
+                if previous_pdf.exists():
+                    previous_pdf.replace(destination)
+                else:
+                    destination.unlink()
+                raise
 
-    indexed = add_documents(chunks)
-    return {"filename": pdf_path.name, "chunks_uploaded": uploaded_chunks, "chunks_indexed": indexed}
+    return {
+        "filename": destination.name,
+        "chunks_uploaded": len(chunks),
+        "chunks_indexed": indexed,
+    }
 
 
 @app.post("/ask")
@@ -57,4 +76,10 @@ def ask(request: AskRequest):
     query = request.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    return generate_answer(query)
+
+    try:
+        return generate_answer(query)
+    except AnswerUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail="The answer provider could not complete the request.") from exc

@@ -29,13 +29,13 @@ Query → Hybrid Retrieval (BM25 + Vector) → Cross-Encoder → Top 3
 ## Setup
 
 ```bash
-python -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp env.example .env
 ```
 
-Add `OPENAI_API_KEY` to `.env`, then copy sample PDFs into `data/`.
+Set `OPENAI_API_KEY` in `.env` to enable answers. Upload text-based PDFs in the UI or place them in `data/` before starting the backend. The first indexing and question requests download the local embedding and reranking models.
 
 ### Run with Python
 
@@ -80,7 +80,7 @@ Response:
 
 ## Evaluation
 
-Replace the placeholder entries in `backend/evaluate.py` with 15–20 real questions and reference answers from your PDFs, then run:
+Add 15–20 real questions and reference answers from your PDFs to `TEST_CASES` in `backend/evaluate.py`, then run:
 
 ```bash
 python -m backend.evaluate
