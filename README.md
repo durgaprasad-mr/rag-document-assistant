@@ -48,9 +48,15 @@ Open `http://localhost:8501` for the UI and `http://localhost:8000/docs` for API
 
 ### Run with Docker
 
+On the first run, copy `env.example` to `.env` and set `OPENAI_API_KEY` in `.env`.
+
 ```bash
-docker compose up --build
+docker compose up -d --build --wait
 ```
+
+Open `http://localhost:8501` for the chat UI and `http://localhost:8000/docs` for the API. PDFs and the search index persist in `data/` and `chroma_db/`. Docker keeps downloaded models in a named volume.
+
+On a Linux server, point your reverse proxy at `127.0.0.1:8501`. Use `RAG_UI_PORT` and `RAG_API_PORT` to change the host ports, or set `RAG_UI_BIND` to choose the UI’s listening address.
 
 ## API
 
