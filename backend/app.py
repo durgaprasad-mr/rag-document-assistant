@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from openai import APIError
 from pydantic import BaseModel
 
@@ -31,6 +32,11 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     query: str
+
+
+@app.get("/", include_in_schema=False)
+def home():
+    return RedirectResponse("/docs")
 
 
 @app.get("/health")
