@@ -9,8 +9,10 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
+from openai import RateLimitError
 from rank_bm25 import BM25Plus
 from sentence_transformers import CrossEncoder
+from torch.nn import Sigmoid
 
 load_dotenv()
 
@@ -23,10 +25,6 @@ INDEX_BATCH_SIZE = 500
 index_lock = RLock()
 _vector_store = None
 _reranker = None
-
-
-class AnswerUnavailableError(RuntimeError):
-    pass
 
 
 def get_vector_store():
@@ -118,15 +116,22 @@ def hybrid_retrieve(query: str, k: int = 12) -> list[Document]:
     return list(combined.values())
 
 
-def rerank(query: str, documents: list[Document], top_n: int = 3) -> list[Document]:
+def rerank(query: str, documents: list[Document], top_n: int = 3) -> list[tuple[float, Document]]:
     global _reranker
     with index_lock:
         if _reranker is None:
             _reranker = CrossEncoder(RERANKER_MODEL)
     pairs = [(query, doc.page_content) for doc in documents]
-    scores = _reranker.predict(pairs)
-    ranked = sorted(zip(documents, scores), key=lambda item: item[1], reverse=True)
-    return [doc for doc, _ in ranked[:top_n]]
+    scores = _reranker.predict(pairs, activation_fn=Sigmoid())
+    return sorted(zip(scores, documents), key=lambda item: item[0], reverse=True)[:top_n]
+
+
+def passage_answer(source: dict, relevance: float) -> dict:
+    # A semantic search returns a nearest match even when every passage is unrelated.
+    if relevance < 0.5:
+        return {"answer": NO_ANSWER, "sources": []}
+    citation = f"{source['document']}, page {source['page']}"
+    return {"answer": f"{source['snippet']}\n\n({citation})", "sources": [source]}
 
 
 def generate_answer(query: str) -> dict:
@@ -134,19 +139,20 @@ def generate_answer(query: str) -> dict:
     if not retrieved:
         return {"answer": NO_ANSWER, "sources": []}
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or api_key == "your-openai-api-key":
-        raise AnswerUnavailableError("Set OPENAI_API_KEY on the backend to enable answers.")
-
     context_parts = []
     sources = []
-    for index, doc in enumerate(rerank(query, retrieved), start=1):
+    ranked = rerank(query, retrieved)
+    for index, (_, doc) in enumerate(ranked, start=1):
         name = doc.metadata.get("document_name") or doc.metadata.get("source") or "Unknown document"
         page = doc.metadata.get("page", doc.metadata.get("page_number"))
         page_label = str(int(page) + 1) if isinstance(page, (int, float)) else str(page or "unknown")
         snippet = doc.page_content.strip()
         context_parts.append(f"[Source {index}: {name}, page {page_label}]\n{snippet}")
         sources.append({"document": name, "page": page_label, "snippet": snippet})
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if os.getenv("ANSWER_MODE") == "extractive" or not api_key or api_key == "your-openai-api-key":
+        return passage_answer(sources[0], ranked[0][0])
 
     system_prompt = f"""Answer the user's question using ONLY the provided context.
 If the answer is not in the context, state exactly: {NO_ANSWER}
@@ -162,10 +168,15 @@ Do not invent or use information outside the retrieved context."""
         max_retries=1,
     )
     context = "\n\n".join(context_parts)
-    response = llm.invoke([
-        ("system", system_prompt),
-        ("human", f"Context:\n{context}\n\nQuestion: {query}"),
-    ])
+    try:
+        response = llm.invoke([
+            ("system", system_prompt),
+            ("human", f"Context:\n{context}\n\nQuestion: {query}"),
+        ])
+    except RateLimitError as exc:
+        if exc.code not in {"insufficient_quota", "credit_balance_exhausted"}:
+            raise
+        return passage_answer(sources[0], ranked[0][0])
 
     answer = response.content.strip()
     return {"answer": answer, "sources": [] if answer == NO_ANSWER else sources}

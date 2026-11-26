@@ -11,7 +11,7 @@ from openai import APIError
 from pydantic import BaseModel
 
 from .ingest import DATA_DIR, InvalidPDFError, ingest_directory, ingest_pdf
-from .rag_pipeline import AnswerUnavailableError, add_documents, generate_answer, index_lock
+from .rag_pipeline import add_documents, generate_answer, index_lock
 
 
 @asynccontextmanager
@@ -85,7 +85,5 @@ def ask(request: AskRequest):
 
     try:
         return generate_answer(query)
-    except AnswerUnavailableError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except APIError as exc:
         raise HTTPException(status_code=502, detail="The answer provider could not complete the request.") from exc

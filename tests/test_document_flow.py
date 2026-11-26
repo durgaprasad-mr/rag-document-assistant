@@ -3,8 +3,10 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Request, Response
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.messages import AIMessage
+from openai import RateLimitError
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
@@ -43,6 +45,7 @@ def isolated_index(tmp_path, monkeypatch):
         rag_pipeline, "HuggingFaceEmbeddings", lambda **kwargs: DeterministicFakeEmbedding(size=16)
     )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANSWER_MODE", raising=False)
     return data_dir
 
 
@@ -58,7 +61,7 @@ def test_upload_and_answer_with_page_citation(isolated_index, monkeypatch):
     monkeypatch.setattr(
         rag_pipeline,
         "_reranker",
-        Mock(predict=lambda pairs: [int("deadline" in text) for _, text in pairs]),
+        Mock(predict=lambda pairs, **kwargs: [int("deadline" in text) for _, text in pairs]),
     )
 
     with TestClient(app.app) as client:
@@ -84,6 +87,40 @@ def test_upload_and_answer_with_page_citation(isolated_index, monkeypatch):
         assert client.post("/ask", json={"query": "   "}).status_code == 400
 
 
+@pytest.mark.parametrize("mode", ["no_key", "extractive", "exhausted"])
+def test_passage_answers_when_openai_is_unavailable(isolated_index, monkeypatch, mode):
+    provider = Mock()
+    monkeypatch.setattr(rag_pipeline, "ChatOpenAI", provider)
+    if mode != "no_key":
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    if mode == "extractive":
+        monkeypatch.setenv("ANSWER_MODE", "extractive")
+    if mode == "exhausted":
+        provider.return_value.invoke.side_effect = RateLimitError(
+            "Out of credits",
+            response=Response(429, request=Request("POST", "https://api.openai.com")),
+            body={"code": "credit_balance_exhausted"},
+        )
+    ranker = Mock()
+    ranker.predict.side_effect = lambda pairs, **kwargs: [
+        0.95 if "deadline" in query and "Friday" in text else 0.01 for query, text in pairs
+    ]
+    monkeypatch.setattr(rag_pipeline, "_reranker", ranker)
+    with TestClient(app.app) as client:
+        assert upload(client, "policy.pdf", pdf_bytes("Overview", "The deadline is Friday.")).is_success
+        answer = client.post("/ask", json={"query": "What is the deadline?"})
+        assert answer.is_success
+        assert answer.json() == {
+            "answer": "The deadline is Friday.\n\n(policy.pdf, page 2)",
+            "sources": [{"document": "policy.pdf", "page": "2", "snippet": "The deadline is Friday."}],
+        }
+        assert client.post("/ask", json={"query": "What is the cafeteria password?"}).json() == {
+            "answer": rag_pipeline.NO_ANSWER, "sources": []
+        }
+    if mode != "exhausted":
+        provider.assert_not_called()
+
+
 def test_reupload_and_restart_replace_old_chunks(isolated_index):
     path = isolated_index / "policy.PDF"
     path.write_bytes(pdf_bytes("Intro", "Old policy"))
@@ -103,7 +140,6 @@ def test_reupload_and_restart_replace_old_chunks(isolated_index):
         assert upload(client, path.name, replacement).status_code == 200
         assert path.read_bytes() == replacement
         assert store.get()["documents"] == ["Current policy"]
-        assert client.post("/ask", json={"query": "Current policy"}).status_code == 503
 
     with TestClient(app.app):
         assert store.get()["documents"] == ["Current policy"]
