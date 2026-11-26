@@ -1,56 +1,62 @@
-from pathlib import Path
+import logging
 import os
+from pathlib import Path
+from shutil import copyfileobj
 
 from dotenv import load_dotenv
 from fastapi import UploadFile
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf.errors import PyPdfError
 
 load_dotenv()
 
 DATA_DIR = Path(os.getenv("DATA_PATH", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger(__name__)
 
 
-def ingest_pdf(file: UploadFile) -> tuple[str, int]:
-    """Save and ingest a PDF, returning its filename and chunk count."""
-    filename = Path(file.filename or "document.pdf").name
-    destination = DATA_DIR / filename
+class InvalidPDFError(ValueError):
+    pass
 
-    if hasattr(file, "file"):
-        with destination.open("wb") as output:
-            output.write(file.file.read())
 
-    loader = PyPDFLoader(str(destination))
-    documents = loader.load()
+def load_pdf_chunks(path: Path) -> list[Document]:
+    try:
+        pages = PyPDFLoader(str(path)).load()
+    except (PyPdfError, ValueError) as exc:
+        raise InvalidPDFError("The PDF could not be read.") from exc
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
-    chunks = splitter.split_documents(documents)
+    chunks = splitter.split_documents(pages)
+    if not chunks:
+        raise InvalidPDFError("The PDF contained no readable text.")
 
     for chunk in chunks:
-        chunk.metadata["source"] = filename
-        chunk.metadata["document_name"] = filename
+        chunk.metadata["source"] = path.name
+        chunk.metadata["document_name"] = path.name
 
-    if not chunks:
-        raise ValueError("The PDF contained no readable text.")
-
-    return str(destination), len(chunks)
+    return chunks
 
 
-def ingest_directory(data_dir: str | Path | None = None) -> list:
-    """Ingest every PDF in a directory for CLI or startup use."""
-    directory = Path(data_dir or DATA_DIR)
+def ingest_pdf(file: UploadFile, staging_dir: Path) -> tuple[Path, list[Document]]:
+    """Copy an upload to staging and extract its chunks before committing it."""
+    path = staging_dir / Path(file.filename).name
+    with path.open("wb") as output:
+        copyfileobj(file.file, output)
+
+    return path, load_pdf_chunks(path)
+
+
+def ingest_directory(data_dir: str | Path | None = None) -> list[Document]:
+    directory = Path(data_dir) if data_dir is not None else DATA_DIR
     directory.mkdir(parents=True, exist_ok=True)
 
     all_chunks = []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
-
-    for pdf_path in directory.glob("*.pdf"):
-        documents = PyPDFLoader(str(pdf_path)).load()
-        chunks = splitter.split_documents(documents)
-        for chunk in chunks:
-            chunk.metadata["source"] = pdf_path.name
-            chunk.metadata["document_name"] = pdf_path.name
-        all_chunks.extend(chunks)
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and path.name.lower().endswith(".pdf"):
+            try:
+                all_chunks.extend(load_pdf_chunks(path))
+            except InvalidPDFError as exc:
+                logger.warning("Skipping %s: %s", path.name, exc)
 
     return all_chunks

@@ -1,17 +1,12 @@
-import os
-
 from datasets import Dataset
 from ragas import evaluate
 from ragas.metrics import answer_relevancy, context_precision, faithfulness
 
-from rag_pipeline import generate_answer
+from .ingest import ingest_directory
+from .rag_pipeline import add_documents, generate_answer
 
 TEST_CASES = [
-    {
-        "question": "What is the purpose of this document?",
-        "answer": "Answer based on your actual PDF documents.",
-        "contexts": ["Replace this example with a real retrieved context."],
-    },
+    # {"question": "When is the application deadline?", "answer": "30 September."},
 ]
 
 
@@ -19,6 +14,7 @@ def run_evaluation():
     if not TEST_CASES:
         raise RuntimeError("Add 15–20 question/answer examples to TEST_CASES.")
 
+    add_documents(ingest_directory())
     rows = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
     for case in TEST_CASES:
         result = generate_answer(case["question"])
